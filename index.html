@@ -242,8 +242,8 @@ let BONDS_REGIONS=[
 ];
 let BONDS=BONDS_REGIONS.flatMap(r=>r.rows);
 let EQ=[
-  {name:'S&P 500',sub:'US Large Cap · Index',val:'—',chg:'—',dir:0},
-  {name:'Nasdaq 100',sub:'US Tech · Index',val:'—',chg:'—',dir:0},
+  {name:'S&P 500',sub:'SPDR SPY · USD proxy',val:'—',chg:'—',dir:0},
+  {name:'Nasdaq 100',sub:'Invesco QQQ · USD proxy',val:'—',chg:'—',dir:0},
   {name:'Nikkei 225',sub:'iShares EWJ · USD proxy',val:'—',chg:'—',dir:0},
 ];
 let FX=[
@@ -264,6 +264,8 @@ function fmtVal(v,dec=2){if(v===null||v===undefined||isNaN(v))return'—';return
 function fmtChg(v){if(v===null||v===undefined||isNaN(v))return'—';const n=parseFloat(v);return(n>=0?'+':'')+n.toFixed(2)+'%'}
 function dirOf(v){const n=parseFloat(v);return isNaN(n)?0:n>0?1:n<0?-1:0}
 function fredDate(d){if(!d)return'—';const M=['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];const p=d.split('-');return`${M[parseInt(p[1])-1]} ${p[0]}`}
+
+// Twelve Data — one at a time with delay to avoid rate limit
 async function tdQuote(symbol){
   const r=await fetch(`https://api.twelvedata.com/quote?symbol=${encodeURIComponent(symbol)}&apikey=${TD_KEY}`);
   if(!r.ok)throw new Error(`HTTP ${r.status}`);
@@ -276,20 +278,30 @@ function parseTDQuote(j){
   if(isNaN(close))return{val:'—',chg:'—',dir:0};
   return{val:close>=1000?fmtVal(close,0):fmtVal(close,2),chg:fmtChg(pct),dir:dirOf(pct)};
 }
+function sleep(ms){return new Promise(r=>setTimeout(r,ms))}
+
+// Frankfurter — with cors proxy fallback
 async function fxPair(from,to){
-  const r1=await fetch(`https://api.frankfurter.app/latest?from=${from}&to=${to}`);
-  if(!r1.ok)throw new Error(`HTTP ${r1.status}`);
-  const j1=await r1.json();
-  const cur=j1.rates[to];
+  const url=`https://api.frankfurter.app/latest?from=${from}&to=${to}`;
+  const r=await fetch(url);
+  if(!r.ok)throw new Error(`HTTP ${r.status}`);
+  const j=await r.json();
+  const cur=j.rates[to];
   const d=new Date();d.setUTCDate(d.getUTCDate()-3);
   const ds=d.toISOString().split('T')[0];
   let prev=null;
-  try{const r2=await fetch(`https://api.frankfurter.app/${ds}?from=${from}&to=${to}`);if(r2.ok){const j2=await r2.json();prev=j2.rates[to];}}catch{}
+  try{
+    const r2=await fetch(`https://api.frankfurter.app/${ds}?from=${from}&to=${to}`);
+    if(r2.ok){const j2=await r2.json();prev=j2.rates[to];}
+  }catch{}
   const pct=prev?((cur-prev)/prev)*100:null;
   return{val:cur.toFixed(4),chg:pct!==null?fmtChg(pct):'—',dir:pct!==null?dirOf(pct):0};
 }
+
+// FRED
 async function fredSeries(id,limit=2){
-  const r=await fetch(`https://api.stlouisfed.org/fred/series/observations?series_id=${id}&sort_order=desc&limit=${limit}&file_type=json&api_key=${FRED_KEY}`);
+  const url=`https://api.stlouisfed.org/fred/series/observations?series_id=${id}&sort_order=desc&limit=${limit}&file_type=json&api_key=${FRED_KEY}`;
+  const r=await fetch(url);
   if(!r.ok)throw new Error(`HTTP ${r.status}`);
   const j=await r.json();
   return(j.observations||[]).filter(o=>o.value!=='.');
@@ -304,6 +316,7 @@ function qoq(obs){if(!obs||obs.length<2)return{val:'—',chg:'—',dir:0,date:'�
 function yoy(obs,step=4){if(!obs||obs.length<step+1)return{val:'—',chg:'—',dir:0,date:'—'};const c=parseFloat(obs[0].value),p=parseFloat(obs[step].value),v=((c-p)/Math.abs(p))*100;return{val:fmtVal(v,1),chg:fmtChg(v),dir:dirOf(v),date:fredDate(obs[0].date)}}
 function mom(obs){if(!obs||obs.length<2)return{val:'—',chg:'—',dir:0,date:'—'};const c=parseFloat(obs[0].value),p=parseFloat(obs[1].value),v=((c-p)/Math.abs(p))*100;return{val:fmtVal(v,2),chg:fmtChg(v),dir:dirOf(v),date:fredDate(obs[0].date)}}
 function directCell(obs){if(!obs||!obs.length)return{val:'—',chg:'—',dir:0,date:'—'};const c=parseFloat(obs[0].value),p=obs[1]?parseFloat(obs[1].value):null,pct=p!==null?(c-p):null;return{val:fmtVal(c,1),chg:pct!==null?(pct>=0?'+':'')+pct.toFixed(2)+'pp':'—',dir:pct!==null?dirOf(pct):0,date:fredDate(obs[0].date)}}
+
 const _log=[];
 function dbg(...args){const line=args.map(a=>typeof a==='object'?JSON.stringify(a,null,2):String(a)).join(' ');_log.push(line);document.getElementById('dbg-txt').textContent=_log.join('\n')}
 function showDbg(){document.getElementById('dbg').style.display='block'}
@@ -313,35 +326,63 @@ async function fetchLiveData(){
   document.getElementById('ts-txt').textContent='FETCHING… TAP HERE FOR DEBUG';
   const errs=[];_log.length=0;
   dbg('=== FETCH START',new Date().toUTCString(),'===');
-  const TD_SYMBOLS=['SPX','NDX','EWJ','GLD','BNO'];
+
+  // Twelve Data — staggered one by one to avoid rate limit
+  // SPY=S&P500 proxy, QQQ=Nasdaq proxy, EWJ=Nikkei proxy, GLD=Gold proxy, BNO=Brent proxy
+  const TD_SYMBOLS=['SPY','QQQ','EWJ','GLD','BNO'];
   const tdResults={};
-  dbg('\n[TD] Fetching:',TD_SYMBOLS.join(','));
-  await Promise.all(TD_SYMBOLS.map(async sym=>{
-    try{const j=await tdQuote(sym);dbg(`  ${sym} OK close=${j.close} pct=${j.percent_change}`);tdResults[sym]=parseTDQuote(j);}
-    catch(e){dbg(`  ${sym} ERR: ${e.message}`);errs.push(`TD ${sym}: ${e.message}`);tdResults[sym]={val:'—',chg:'—',dir:0};}
-  }));
+  dbg('\n[TD] Fetching one by one with delay');
+  for(const sym of TD_SYMBOLS){
+    try{
+      const j=await tdQuote(sym);
+      dbg(`  ${sym} OK close=${j.close} pct=${j.percent_change}`);
+      tdResults[sym]=parseTDQuote(j);
+    }catch(e){
+      dbg(`  ${sym} ERR: ${e.message}`);
+      errs.push(`TD ${sym}: ${e.message}`);
+      tdResults[sym]={val:'—',chg:'—',dir:0};
+    }
+    await sleep(500); // wait 500ms between each call — stays under rate limit
+  }
+
   const g=s=>tdResults[s]||{val:'—',chg:'—',dir:0};
   EQ=[
-    {name:'S&P 500',sub:'US Large Cap · Index',...g('SPX')},
-    {name:'Nasdaq 100',sub:'US Tech · Index',...g('NDX')},
+    {name:'S&P 500',sub:'SPDR SPY · USD proxy',...g('SPY')},
+    {name:'Nasdaq 100',sub:'Invesco QQQ · USD proxy',...g('QQQ')},
     {name:'Nikkei 225',sub:'iShares EWJ · USD proxy',...g('EWJ')},
   ];
   COMM=[
     {name:'Gold',sub:'SPDR GLD · USD/share',...g('GLD')},
     {name:'Brent Crude',sub:'ProShares BNO · USD/sh',...g('BNO')},
   ];
+
+  // FX — Frankfurter
   dbg('\n[FX] Fetching EUR/USD and GBP/EUR');
-  await Promise.all([
-    fxPair('EUR','USD').then(r=>{dbg(`  EUR/USD OK ${r.val}`);FX[0]={name:'EUR / USD',sub:'Euro · US Dollar',...r};}).catch(e=>{dbg(`  EUR/USD ERR: ${e.message}`);errs.push('FX EUR/USD: '+e.message);}),
-    fxPair('GBP','EUR').then(r=>{dbg(`  GBP/EUR OK ${r.val}`);FX[1]={name:'GBP / EUR',sub:'Pound Sterling · Euro',...r};}).catch(e=>{dbg(`  GBP/EUR ERR: ${e.message}`);errs.push('FX GBP/EUR: '+e.message);}),
-  ]);
+  try{
+    const fx1=await fxPair('EUR','USD');
+    dbg(`  EUR/USD OK ${fx1.val}`);
+    FX[0]={name:'EUR / USD',sub:'Euro · US Dollar',...fx1};
+  }catch(e){dbg(`  EUR/USD ERR: ${e.message}`);errs.push('FX EUR/USD: '+e.message);}
+  try{
+    const fx2=await fxPair('GBP','EUR');
+    dbg(`  GBP/EUR OK ${fx2.val}`);
+    FX[1]={name:'GBP / EUR',sub:'Pound Sterling · Euro',...fx2};
+  }catch(e){dbg(`  GBP/EUR ERR: ${e.message}`);errs.push('FX GBP/EUR: '+e.message);}
+  // FRED — Bond yields — sequential to avoid overload
   const BOND_IDS={US10Y:'DGS10',DE10Y:'IRLTLT01DEM156N',DE2Y:'INTGSBDEM193N',GB10Y:'IRLTLT01GBM156N',JP10Y:'IRLTLT01JPM156N'};
   dbg('\n[BONDS] Fetching from FRED');
   const bondObs={};
-  await Promise.all(Object.entries(BOND_IDS).map(async([k,id])=>{
-    try{bondObs[k]=await fredSeries(id,2);dbg(`  ${k} OK ${bondObs[k][0]?.value}`);}
-    catch(e){dbg(`  ${k} ERR: ${e.message}`);errs.push(`FRED ${k}: ${e.message}`);bondObs[k]=[];}
-  }));
+  for(const [k,id] of Object.entries(BOND_IDS)){
+    try{
+      bondObs[k]=await fredSeries(id,2);
+      dbg(`  ${k} OK ${bondObs[k][0]?.value}`);
+    }catch(e){
+      dbg(`  ${k} ERR: ${e.message}`);
+      errs.push(`FRED ${k}: ${e.message}`);
+      bondObs[k]=[];
+    }
+    await sleep(200);
+  }
   function bondRow(obs){if(!obs||!obs.length)return{val:'—',chg:'—',dir:0};const cur=parseFloat(obs[0].value),prv=obs[1]?parseFloat(obs[1].value):null,pct=prv!==null?((cur-prv)/Math.abs(prv))*100:null;return{val:fmtVal(cur,2),chg:pct!==null?fmtChg(pct):'—',dir:pct!==null?dirOf(pct):0}}
   BONDS_REGIONS=[
     {flag:'🇺🇸',region:'United States',rows:[{name:'US 10Y Treasury',sub:'Govt Bond Yield · %',...bondRow(bondObs.US10Y)}]},
@@ -350,30 +391,66 @@ async function fetchLiveData(){
     {flag:'🇯🇵',region:'Asia',rows:[{name:'JP 10Y JGB',sub:'Japan Govt Bond Yield · %',...bondRow(bondObs.JP10Y)}]},
   ];
   BONDS=BONDS_REGIONS.flatMap(r=>r.rows);
+
+  // FRED — Macro — sequential
   dbg('\n[MACRO] Fetching from FRED');
   const macroObs={};
-  await Promise.all([
-    fredSeries('A191RL1Q225SBEA',2).then(d=>{macroObs.US_GDP_QOQ=d;dbg(`  US_GDP_QOQ OK ${d[0]?.value}`);}).catch(e=>{dbg(`  US_GDP_QOQ ERR: ${e.message}`);macroObs.US_GDP_QOQ=[];}),
-    fredSeries('A191RO1Q156NBEA',2).then(d=>{macroObs.US_GDP_YOY=d;dbg(`  US_GDP_YOY OK ${d[0]?.value}`);}).catch(e=>{dbg(`  US_GDP_YOY ERR: ${e.message}`);macroObs.US_GDP_YOY=[];}),
-    fredSeries('CPIAUCSL',13).then(d=>{macroObs.US_CPI=d;dbg(`  US_CPI OK ${d[0]?.value}`);}).catch(e=>{dbg(`  US_CPI ERR: ${e.message}`);macroObs.US_CPI=[];}),
-    fredSeries('CLVMNACSCAB1GQEA19',5).then(d=>{macroObs.EZ_GDP=d;dbg(`  EZ_GDP OK ${d[0]?.value}`);}).catch(e=>{dbg(`  EZ_GDP ERR: ${e.message}`);macroObs.EZ_GDP=[];}),
-    fredSeries('CP0000EZ17M086NEST',2).then(d=>{macroObs.EZ_CPI=d;dbg(`  EZ_CPI OK ${d[0]?.value}`);}).catch(e=>{dbg(`  EZ_CPI ERR: ${e.message}`);macroObs.EZ_CPI=[];}),
-    fredSeries('CLVMNACSCAB1GQUK',5).then(d=>{macroObs.UK_GDP=d;dbg(`  UK_GDP OK ${d[0]?.value}`);}).catch(e=>{dbg(`  UK_GDP ERR: ${e.message}`);macroObs.UK_GDP=[];}),
-    fredSeries('GBRCPIALLMINMEI',13).then(d=>{macroObs.UK_CPI=d;dbg(`  UK_CPI OK ${d[0]?.value}`);}).catch(e=>{dbg(`  UK_CPI ERR: ${e.message}`);macroObs.UK_CPI=[];}),
-    fredSeries('JPNRGDPEXP',5).then(d=>{macroObs.JP_GDP=d;dbg(`  JP_GDP OK ${d[0]?.value}`);}).catch(e=>{dbg(`  JP_GDP ERR: ${e.message}`);macroObs.JP_GDP=[];}),
-    fredSeries('JPNCPIALLMINMEI',13).then(d=>{macroObs.JP_CPI=d;dbg(`  JP_CPI OK ${d[0]?.value}`);}).catch(e=>{dbg(`  JP_CPI ERR: ${e.message}`);macroObs.JP_CPI=[];}),
-  ]);
-  MACRO=[
-    {flag:'🇺🇸',country:'United States',src:'FRED',cells:[{lbl:'GDP QoQ',unit:'%',...directCell(macroObs.US_GDP_QOQ)},{lbl:'GDP YoY',unit:'%',...directCell(macroObs.US_GDP_YOY)},{lbl:'CPI MoM',unit:'%',...mom(macroObs.US_CPI)},{lbl:'CPI YoY',unit:'%',...yoy(macroObs.US_CPI,12)}]},
-    {flag:'🇪🇺',country:'Euro Area',src:'FRED',cells:[{lbl:'GDP QoQ',unit:'%',...qoq(macroObs.EZ_GDP)},{lbl:'GDP YoY',unit:'%',...yoy(macroObs.EZ_GDP,4)},{lbl:'CPI MoM',unit:'%',...fredCell(macroObs.EZ_CPI)},{lbl:'CPI YoY',unit:'%',...fredCell(macroObs.EZ_CPI)}]},
-    {flag:'🇬🇧',country:'United Kingdom',src:'FRED',cells:[{lbl:'GDP QoQ',unit:'%',...qoq(macroObs.UK_GDP)},{lbl:'GDP YoY',unit:'%',...yoy(macroObs.UK_GDP,4)},{lbl:'CPI MoM',unit:'%',...mom(macroObs.UK_CPI)},{lbl:'CPI YoY',unit:'%',...yoy(macroObs.UK_CPI,12)}]},
-    {flag:'🇯🇵',country:'Japan',src:'FRED',cells:[{lbl:'GDP QoQ',unit:'%',...qoq(macroObs.JP_GDP)},{lbl:'GDP YoY',unit:'%',...yoy(macroObs.JP_GDP,4)},{lbl:'CPI MoM',unit:'%',...mom(macroObs.JP_CPI)},{lbl:'CPI YoY',unit:'%',...yoy(macroObs.JP_CPI,12)}]},
+  const MACRO_SERIES=[
+    ['A191RL1Q225SBEA','US_GDP_QOQ',2],
+    ['A191RO1Q156NBEA','US_GDP_YOY',2],
+    ['CPIAUCSL','US_CPI',13],
+    ['CLVMNACSCAB1GQEA19','EZ_GDP',5],
+    ['CP0000EZ17M086NEST','EZ_CPI',2],
+    ['CLVMNACSCAB1GQUK','UK_GDP',5],
+    ['GBRCPIALLMINMEI','UK_CPI',13],
+    ['JPNRGDPEXP','JP_GDP',5],
+    ['JPNCPIALLMINMEI','JP_CPI',13],
   ];
+  for(const [id,key,limit] of MACRO_SERIES){
+    try{
+      macroObs[key]=await fredSeries(id,limit);
+      dbg(`  ${key} OK ${macroObs[key][0]?.value}`);
+    }catch(e){
+      dbg(`  ${key} ERR: ${e.message}`);
+      errs.push(`FRED ${key}: ${e.message}`);
+      macroObs[key]=[];
+    }
+    await sleep(200);
+  }
+    MACRO=[
+    {flag:'🇺🇸',country:'United States',src:'FRED',cells:[
+      {lbl:'GDP QoQ',unit:'%',...directCell(macroObs.US_GDP_QOQ)},
+      {lbl:'GDP YoY',unit:'%',...directCell(macroObs.US_GDP_YOY)},
+      {lbl:'CPI MoM',unit:'%',...mom(macroObs.US_CPI)},
+      {lbl:'CPI YoY',unit:'%',...yoy(macroObs.US_CPI,12)},
+    ]},
+    {flag:'🇪🇺',country:'Euro Area',src:'FRED',cells:[
+      {lbl:'GDP QoQ',unit:'%',...qoq(macroObs.EZ_GDP)},
+      {lbl:'GDP YoY',unit:'%',...yoy(macroObs.EZ_GDP,4)},
+      {lbl:'CPI MoM',unit:'%',...fredCell(macroObs.EZ_CPI)},
+      {lbl:'CPI YoY',unit:'%',...fredCell(macroObs.EZ_CPI)},
+    ]},
+    {flag:'🇬🇧',country:'United Kingdom',src:'FRED',cells:[
+      {lbl:'GDP QoQ',unit:'%',...qoq(macroObs.UK_GDP)},
+      {lbl:'GDP YoY',unit:'%',...yoy(macroObs.UK_GDP,4)},
+      {lbl:'CPI MoM',unit:'%',...mom(macroObs.UK_CPI)},
+      {lbl:'CPI YoY',unit:'%',...yoy(macroObs.UK_CPI,12)},
+    ]},
+    {flag:'🇯🇵',country:'Japan',src:'FRED',cells:[
+      {lbl:'GDP QoQ',unit:'%',...qoq(macroObs.JP_GDP)},
+      {lbl:'GDP YoY',unit:'%',...yoy(macroObs.JP_GDP,4)},
+      {lbl:'CPI MoM',unit:'%',...mom(macroObs.JP_CPI)},
+      {lbl:'CPI YoY',unit:'%',...yoy(macroObs.JP_CPI,12)},
+    ]},
+  ];
+
   render();
   const n=new Date(),p=v=>String(v).padStart(2,'0');
   dbg(`\n=== DONE — ${errs.length} error(s) ===`);
   if(errs.length)dbg('ERRORS:\n'+errs.join('\n'));
-  document.getElementById('ts-txt').textContent=errs.length?`${errs.length} issue(s) · TAP FOR DEBUG`:`UPDATED ${p(n.getUTCHours())}:${p(n.getUTCMinutes())} UTC · TAP FOR DEBUG`;
+  document.getElementById('ts-txt').textContent=errs.length
+    ?`${errs.length} issue(s) · TAP FOR DEBUG`
+    :`UPDATED ${p(n.getUTCHours())}:${p(n.getUTCMinutes())} UTC · TAP FOR DEBUG`;
   btn.classList.remove('spin');
 }
 function tick(){const n=new Date(),p=v=>String(v).padStart(2,'0');document.getElementById('clock').textContent=`${p(n.getUTCHours())}:${p(n.getUTCMinutes())}:${p(n.getUTCSeconds())} UTC`;const D=['SUN','MON','TUE','WED','THU','FRI','SAT'],M=['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];document.getElementById('dateline').textContent=`${D[n.getUTCDay()]} ${p(n.getUTCDate())} ${M[n.getUTCMonth()]} ${n.getUTCFullYear()}`}
@@ -401,50 +478,12 @@ document.getElementById('screens').addEventListener('touchend',e=>{
 },{passive:true});
 function cls(dir){return dir>0?'pos':dir<0?'neg':'neu'}
 function arrow(dir){return dir>0?'▲':dir<0?'▼':'▬'}
-function makeRow(d){
-  return`<div class="drow ${cls(d.dir)}">
-    <div class="dr-left">
-      <div class="dr-name">${d.name}</div>
-      <div class="dr-sub">${d.sub}</div>
-    </div>
-    <div class="dr-right">
-      <div class="dr-val">${d.val}</div>
-      <div class="dr-chg ${cls(d.dir)}">${d.chg}</div>
-    </div>
-  </div>`;
-}
+function makeRow(d){return`<div class="drow ${cls(d.dir)}"><div class="dr-left"><div class="dr-name">${d.name}</div><div class="dr-sub">${d.sub}</div></div><div class="dr-right"><div class="dr-val">${d.val}</div><div class="dr-chg ${cls(d.dir)}">${d.chg}</div></div></div>`}
 function makeRows(arr){return arr.map(makeRow).join('')}
-function makeMacro(m){
-  const cells=m.cells.map(c=>`
-    <div class="macro-cell">
-      <div class="mc-lbl">${c.lbl}</div>
-      <div class="mc-val">${c.val}<span class="mc-unit">${c.unit}</span></div>
-      <div class="mc-chg ${cls(c.dir)}">${arrow(c.dir)} ${c.chg}</div>
-      <div class="mc-date">${c.date}</div>
-    </div>`).join('');
-  return`
-    <div class="macro-card-hdr">
-      <div class="macro-flag-name">
-        <span class="macro-flag">${m.flag}</span>
-        <span class="macro-country">${m.country}</span>
-      </div>
-      <span class="macro-src">${m.src}</span>
-    </div>
-    <div class="macro-grid">${cells}</div>`;
-}
-function yieldOf(name){
-  for(const r of BONDS_REGIONS){
-    const row=r.rows.find(b=>b.name===name);
-    if(row) return parseFloat(row.val);
-  }
-  return null;
-}
+function makeMacro(m){const cells=m.cells.map(c=>`<div class="macro-cell"><div class="mc-lbl">${c.lbl}</div><div class="mc-val">${c.val}<span class="mc-unit">${c.unit}</span></div><div class="mc-chg ${cls(c.dir)}">${arrow(c.dir)} ${c.chg}</div><div class="mc-date">${c.date}</div></div>`).join('');return`<div class="macro-card-hdr"><div class="macro-flag-name"><span class="macro-flag">${m.flag}</span><span class="macro-country">${m.country}</span></div><span class="macro-src">${m.src}</span></div><div class="macro-grid">${cells}</div>`}
+function yieldOf(name){for(const r of BONDS_REGIONS){const row=r.rows.find(b=>b.name===name);if(row)return parseFloat(row.val);}return null}
 function computeSpreads(){
-  const us10=yieldOf('US 10Y Treasury');
-  const de10=yieldOf('DE 10Y Bund');
-  const de2=yieldOf('DE 2Y Schatz');
-  const uk10=yieldOf('UK 10Y Gilt');
-  const jp10=yieldOf('JP 10Y JGB');
+  const us10=yieldOf('US 10Y Treasury'),de10=yieldOf('DE 10Y Bund'),de2=yieldOf('DE 2Y Schatz'),uk10=yieldOf('UK 10Y Gilt'),jp10=yieldOf('JP 10Y JGB');
   function bp(a,b){return Math.round((a-b)*100*10)/10}
   function sign(v){return v>0?'+':''}
   return[
@@ -454,116 +493,18 @@ function computeSpreads(){
     {name:'DE 10Y vs DE 2Y',sub:'German yield curve steepness',note:`${de10}% − ${de2}%`,val:bp(de10,de2)},
   ].map(s=>({...s,sign:sign(s.val)}));
 }
-function makeSpreadRow(s){
-  return`<div class="srow">
-    <div class="sr-left">
-      <div class="sr-name">${s.name}</div>
-      <div class="sr-sub">${s.sub}</div>
-    </div>
-    <div class="sr-right">
-      <div class="sr-val">${s.sign}${s.val}<span class="sr-unit">bp</span></div>
-      <div class="sr-note">${s.note}</div>
-    </div>
-  </div>`;
-}
-function makeCSpreadRow(s){
-  return`<div class="csrow">
-    <div>
-      <div class="csr-name">${s.name}</div>
-      <div class="csr-sub">${s.sub}</div>
-    </div>
-    <div class="csr-right">
-      <div class="csr-val">${s.sign}${s.val}<span class="csr-unit">bp</span></div>
-      <div class="csr-note">${s.note}</div>
-    </div>
-  </div>`;
-}
-function makeBondsCard(){
-  const spreads=computeSpreads();
-  const header=`<div class="mcard-hdr"><span class="mcard-hdr-title">Government Bond Yields</span><span class="badge badge-live">LIVE</span></div>`;
-  const body=BONDS_REGIONS.map(r=>`
-    <div class="region-hdr">
-      <span class="region-flag">${r.flag}</span>
-      <span class="region-label">${r.region}</span>
-    </div>
-    ${r.rows.map(makeRow).join('')}
-  `).join('');
-  const spreadSection=`
-    <div class="spread-hdr">
-      <span class="spread-hdr-label">Yield Spreads</span>
-      <span class="spread-hdr-badge">CALC · bp</span>
-    </div>
-    ${spreads.map(makeSpreadRow).join('')}`;
-  return header+body+spreadSection;
-}
-function makeCRow(d){
-  return`<div class="crow ${cls(d.dir)}">
-    <div>
-      <div class="cr-name">${d.name}</div>
-      <div class="cr-sub">${d.sub}</div>
-    </div>
-    <div class="cr-right">
-      <div class="cr-val">${d.val}</div>
-      <div class="cr-chg ${cls(d.dir)}">${arrow(d.dir)} ${d.chg}</div>
-    </div>
-  </div>`;
-}
-function makeOvBlock(title,src,arr){
-  return`<div class="ov-block">
-    <div class="ov-block-hdr">
-      <span class="ov-block-title">${title}</span>
-      <span class="ov-block-src">${src}</span>
-    </div>
-    ${arr.map(makeCRow).join('')}
-  </div>`;
-}
-function makeOvMacro(m){
-  const [g1,g2,c1,c2]=m.cells;
-  function cell(c){
-    return`<div class="ov-mc">
-      <div class="ov-mc-lbl">${c.lbl}</div>
-      <div class="ov-mc-val">${c.val}<span class="ov-mc-unit">${c.unit}</span></div>
-      <div class="ov-mc-chg ${cls(c.dir)}">${arrow(c.dir)} ${c.chg}</div>
-      <div class="ov-mc-date">${c.date}</div>
-    </div>`;
-  }
-  return`
-    <div class="ov-macro-country">
-      <span class="ov-macro-flag">${m.flag}</span>
-      <span class="ov-macro-name">${m.country}</span>
-      <span class="ov-macro-src">${m.src}</span>
-    </div>
-    <div class="ov-macro-row">${cell(g1)}${cell(g2)}</div>
-    <div class="ov-macro-row">${cell(c1)}${cell(c2)}</div>`;
-}
+function makeSpreadRow(s){return`<div class="srow"><div class="sr-left"><div class="sr-name">${s.name}</div><div class="sr-sub">${s.sub}</div></div><div class="sr-right"><div class="sr-val">${s.sign}${s.val}<span class="sr-unit">bp</span></div><div class="sr-note">${s.note}</div></div></div>`}
+function makeCSpreadRow(s){return`<div class="csrow"><div><div class="csr-name">${s.name}</div><div class="csr-sub">${s.sub}</div></div><div class="csr-right"><div class="csr-val">${s.sign}${s.val}<span class="csr-unit">bp</span></div><div class="csr-note">${s.note}</div></div></div>`}
+function makeBondsCard(){const spreads=computeSpreads();const header=`<div class="mcard-hdr"><span class="mcard-hdr-title">Government Bond Yields</span><span class="badge badge-live">LIVE</span></div>`;const body=BONDS_REGIONS.map(r=>`<div class="region-hdr"><span class="region-flag">${r.flag}</span><span class="region-label">${r.region}</span></div>${r.rows.map(makeRow).join('')}`).join('');const spreadSection=`<div class="spread-hdr"><span class="spread-hdr-label">Yield Spreads</span><span class="spread-hdr-badge">CALC · bp</span></div>${spreads.map(makeSpreadRow).join('')}`;return header+body+spreadSection}
+function makeCRow(d){return`<div class="crow ${cls(d.dir)}"><div><div class="cr-name">${d.name}</div><div class="cr-sub">${d.sub}</div></div><div class="cr-right"><div class="cr-val">${d.val}</div><div class="cr-chg ${cls(d.dir)}">${arrow(d.dir)} ${d.chg}</div></div></div>`}
+function makeOvBlock(title,src,arr){return`<div class="ov-block"><div class="ov-block-hdr"><span class="ov-block-title">${title}</span><span class="ov-block-src">${src}</span></div>${arr.map(makeCRow).join('')}</div>`}
+function makeOvMacro(m){const [g1,g2,c1,c2]=m.cells;function cell(c){return`<div class="ov-mc"><div class="ov-mc-lbl">${c.lbl}</div><div class="ov-mc-val">${c.val}<span class="ov-mc-unit">${c.unit}</span></div><div class="ov-mc-chg ${cls(c.dir)}">${arrow(c.dir)} ${c.chg}</div><div class="ov-mc-date">${c.date}</div></div>`}return`<div class="ov-macro-country"><span class="ov-macro-flag">${m.flag}</span><span class="ov-macro-name">${m.country}</span><span class="ov-macro-src">${m.src}</span></div><div class="ov-macro-row">${cell(g1)}${cell(g2)}</div><div class="ov-macro-row">${cell(c1)}${cell(c2)}</div>`}
 function render(){
   const spreads=computeSpreads();
   const ov=document.getElementById('overview-content');
   ov.style.cssText='display:flex;flex-direction:column;gap:10px;';
-  const bondsBlock=`<div class="ov-block">
-    <div class="ov-block-hdr">
-      <span class="ov-block-title">Rates & Bonds</span>
-      <span class="ov-block-src">FRED · Twelve Data</span>
-    </div>
-    ${BONDS.map(makeCRow).join('')}
-    <div class="spread-hdr" style="border-top:1px solid var(--border2)">
-      <span class="spread-hdr-label">Yield Spreads</span>
-      <span class="spread-hdr-badge">CALC · bp</span>
-    </div>
-    ${spreads.map(makeCSpreadRow).join('')}
-  </div>`;
-  ov.innerHTML=
-    bondsBlock+
-    makeOvBlock('Equities','Twelve Data',EQ)+
-    makeOvBlock('FX','Frankfurter · ECB',FX)+
-    makeOvBlock('Commodities','Twelve Data',COMM)+
-    `<div class="ov-block">
-      <div class="ov-block-hdr">
-        <span class="ov-block-title">Macro Indicators</span>
-        <span class="ov-block-src">FRED · Official</span>
-      </div>
-      ${MACRO.map(m=>makeOvMacro(m)).join('')}
-    </div>`;
+  const bondsBlock=`<div class="ov-block"><div class="ov-block-hdr"><span class="ov-block-title">Rates & Bonds</span><span class="ov-block-src">FRED · Twelve Data</span></div>${BONDS.map(makeCRow).join('')}<div class="spread-hdr" style="border-top:1px solid var(--border2)"><span class="spread-hdr-label">Yield Spreads</span><span class="spread-hdr-badge">CALC · bp</span></div>${spreads.map(makeCSpreadRow).join('')}</div>`;
+  ov.innerHTML=bondsBlock+makeOvBlock('Equities','Twelve Data',EQ)+makeOvBlock('FX','Frankfurter · ECB',FX)+makeOvBlock('Commodities','Twelve Data',COMM)+`<div class="ov-block"><div class="ov-block-hdr"><span class="ov-block-title">Macro Indicators</span><span class="ov-block-src">FRED · Official</span></div>${MACRO.map(m=>makeOvMacro(m)).join('')}</div>`;
   document.getElementById('bonds-card').innerHTML=makeBondsCard();
   document.getElementById('eq-rows').innerHTML=makeRows(EQ);
   document.getElementById('fx-rows').innerHTML=makeRows(FX);
