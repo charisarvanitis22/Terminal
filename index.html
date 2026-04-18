@@ -6,6 +6,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" content="#080b0f">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.gstatic.com; connect-src 'self' https://api.twelvedata.com https://api.frankfurter.app https://api.stlouisfed.org;"
 <title>TE TERMINAL</title>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -342,7 +343,7 @@ async function fetchLiveData(){
       errs.push(`TD ${sym}: ${e.message}`);
       tdResults[sym]={val:'—',chg:'—',dir:0};
     }
-    await sleep(500); // wait 500ms between each call — stays under rate limit
+        await sleep(8000); // wait 8s between calls — free tier limit is 8/min
   }
 
   const g=s=>tdResults[s]||{val:'—',chg:'—',dir:0};
